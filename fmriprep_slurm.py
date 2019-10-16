@@ -1,5 +1,8 @@
 #!/usr/bin/env python2
-# Jeff Eilbott, 2018,
+#
+# fmriprep slurm wrapper, designed around 1.5.0
+#
+# Jeff Eilbott, SurveyBott, 2018, info@surveybott.com
 import os,argparse,sys,textwrap
 
 # parse arguments
@@ -12,19 +15,20 @@ def is_dir(parser, arg):
 p = argparse.ArgumentParser(description='Run fmriprep pipeline in parallel by submitting an array job to the SLURM scheduler.\nJeff Eilbott, 2018, jeilbott@surveybott.com',formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 p.add_argument('bids_dir',help='top-level BIDS directory')
 p.add_argument('out_dir',help='directory to output derivatives')
-p.add_argument('--fmriprep',type=lambda x: x.split(),metavar='',help='fmriprep args (surround all in one set of quotes), passed to container')
-p.add_argument('--include',nargs='*',metavar='',help='list of subjects to include')
-p.add_argument('--exclude',nargs='*',metavar='',help='list of subjects to exclude')
-p.add_argument('--ncpu',type=int,default=16,metavar='',help='number of cpus per subject')
-p.add_argument('--mem-mb-per-cpu',default=6000,type=int,metavar='',help='memory per cpu',dest='mem')
-p.add_argument('--partition',default="general",metavar='',help='SLURM partition')
-p.add_argument('--limit',type=int,metavar='',help='max number of subjects to run concurrently')
-p.add_argument('--hrs-per-sub',type=int,default=6,metavar='',help='number of hours to devote to each subject for walltime purposes (be liberal)',dest='hrs')
-p.add_argument('--max-hrs',type=int,default=720,metavar='',help='max walltime (hrs) job scheduler will allow',dest='max_hrs')
+p.add_argument('--fmriprep',type=lambda x: x.split(),metavar="'--argN [argN] ...'",help='fmriprep args (surround all in one set of quotes), passed to container')
+p.add_argument('--include',nargs='*',help='list of subjects to include')
+p.add_argument('--exclude',nargs='*',help='list of subjects to exclude')
+p.add_argument('--ncpu',type=int,default=8,help='number of cpus per subject')
+p.add_argument('--mem',default=10000,type=int,metavar='MB',help='memory per subject in MB',dest='mem')
+p.add_argument('--partition',default="general",help='SLURM partition')
+p.add_argument('--limit',type=int,help='max number of subjects to run concurrently')
+p.add_argument('--hrs-per-sub',type=int,default=24,help='number of hours to devote to each subject for walltime purposes (be liberal)',dest='hrs')
 p.add_argument('--container',default='singularity',help='container executable')
-p.add_argument('--container_img',default='%s/local/fmriprep-latest.simg' % os.environ["HOME"],metavar='',help='fmriprep container image',dest='img')
-p.add_argument('--cmd_pre',default='module load Singularity; ',help='setup code to run (inline os.system) prior to main container call. useful to setup enviorment')
+p.add_argument('--container_img',default='%s/local/simg/fmriprep-latest.simg' % os.environ["HOME"],help='fmriprep container image',dest='img')
+p.add_argument('--cmd_pre',default='',help='setup code to run (inline os.system) prior to main container call. useful to setup enviorment')
 args = p.parse_args()
+args.out_dir = args.out_dir.replace('~',os.environ['HOME'])
+args.bids_dir = args.bids_dir.replace('~',os.environ['HOME'])
 #print(args)
 
 # get subject directories
@@ -44,10 +48,7 @@ for root,dirs,files in os.walk(args.bids_dir,topdown=True):
 n = len(sub)
 if n >= 1:
     # setup SLURM parameters
-    hrs = n*args.hrs
-    if hrs > args.max_hrs:
-        hrs = args.max_hrs
-    time = "%d:00:00" % hrs
+    time = "%d:00:00" % args.hrs
 
     if args.limit is not None:
         limit = "%%%d" % args.limit
@@ -55,18 +56,18 @@ if n >= 1:
         limit = ''
 
     # setup fmriprep parameters
-    fmriprep = [args.bids_dir, args.out_dir,'participant','--nthreads',str(args.ncpu),'--mem_mb',str(args.mem*args.ncpu)] + args.fmriprep
+    fmriprep = [args.bids_dir, args.out_dir,'participant','--nthreads',str(args.ncpu),'--mem-mb',str(args.mem)] + args.fmriprep
 
     # generate SLURM sbatch file
     slurmDir = os.path.join(args.out_dir,"slurm")
     if not os.path.exists(slurmDir):
-        os.mkdir(slurmDir)
+        os.makedirs(slurmDir)
 
     print textwrap.dedent("""\
     #!/usr/bin/env python2
     #SBATCH --partition=%s
     #SBATCH --cpus-per-task=%d
-    #SBATCH --mem-per-cpu=%d
+    #SBATCH --mem=%dM
     #SBATCH --time=%s
     #SBATCH --array=0-%d%s
     #SBATCH --job-name=fmriprep
