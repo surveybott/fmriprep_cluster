@@ -30,7 +30,7 @@ args = p.parse_args()
 args.out_dir = args.out_dir.replace('~',os.environ['HOME'])
 args.bids_dir = args.bids_dir.replace('~',os.environ['HOME'])
 args.cmd_pre = args.cmd_pre.strip()
-if not args.cmd_pre.endswith(""):
+if not args.cmd_pre.endswith(";"):
     args.cmd_pre = args.cmd_pre + ";"
 #print(args)
 
