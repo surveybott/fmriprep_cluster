@@ -20,15 +20,18 @@ p.add_argument('--include',nargs='*',help='list of subjects to include')
 p.add_argument('--exclude',nargs='*',help='list of subjects to exclude')
 p.add_argument('--ncpu',type=int,default=8,help='number of cpus per subject')
 p.add_argument('--mem',default=10000,type=int,metavar='MB',help='memory per subject in MB',dest='mem')
-p.add_argument('--queue',default="",help='PBS queue name')
+p.add_argument('--queue',help='PBS queue name')
 p.add_argument('--limit',type=int,help='max number of subjects to run concurrently')
 p.add_argument('--hrs-per-sub',type=int,default=24,help='number of hours to devote to each subject for walltime purposes (be liberal)',dest='hrs')
 p.add_argument('--container',default='singularity',help='container executable')
-p.add_argument('--container_img',default='%s/local/simg/fmriprep-latest.simg' % os.environ["HOME"],help='fmriprep container image',dest='img')
+p.add_argument('--container_img',default='%s/local/simg/fmriprep-latest.simg' % os.environ.get("HOME"),help='fmriprep container image',dest='img')
+p.add_argument('--fs_license',default=os.environ.get("FS_LICENSE"),help="FS_LICENSE, pulls from environment by default")
+p.add_argument('--templateflow_home',default=os.environ.get('TEMPLATEFLOW_HOME'),help="TEMPLATEFLOW_HOME, esp. useful if containing pre-downloaded templates, pulls from environment by default")
 p.add_argument('--cmd_pre',default='module load singularity',help='setup code to run (inline os.system) prior to main container call. useful to setup enviorment')
 args = p.parse_args()
-args.out_dir = args.out_dir.replace('~',os.environ['HOME'])
-args.bids_dir = args.bids_dir.replace('~',os.environ['HOME'])
+if os.environ.get('HOME') is not None:
+    args.out_dir = args.out_dir.replace('~',os.environ['HOME'])
+    args.bids_dir = args.bids_dir.replace('~',os.environ['HOME'])
 args.cmd_pre = args.cmd_pre.strip()
 if not args.cmd_pre.endswith(";"):
     args.cmd_pre = args.cmd_pre + ";"
@@ -58,6 +61,20 @@ if n >= 1:
     else:
         limit = ''
 
+    if args.queue is not None:
+        queue = "#PBS -q %s" % args.queue
+    else:
+        queue = ''
+
+    # container options (deal with fs_license and templateflow_home)
+    cont_opts = '--cleanenv --bind $TMPDIR:/tmp'
+    if args.fs_license is not None:
+        cont_opts = cont_opts + " --bind %s:/opt/freesurfer/license.txt" % args.fs_license
+    if args.templateflow_home is not None:
+        args.cmd_pre = args.cmd_pre + " export SINGULARITYENV_TEMPLATEFLOW_HOME=/templateflow;"
+        cont_opts = cont_opts + " --bind %s:/templateflow" % args.templateflow_home
+
+
     # setup fmriprep parameters
     fmriprep = [args.bids_dir, args.out_dir,'participant','--nthreads',str(args.ncpu),'--mem-mb',str(args.mem)] + args.fmriprep
 
@@ -68,7 +85,7 @@ if n >= 1:
 
     print textwrap.dedent("""\
     #!/usr/bin/env python2
-    #PBS -q %s
+    %s
     #PBS -l select=1:ncpus=%d:mem=%dmb,walltime=%s
     #PBS -J 0-%d%s
     #PBS -N fmriprep
@@ -77,9 +94,9 @@ if n >= 1:
 
     from os import system,environ
 
-    # setup subject array""" % (args.queue,args.ncpu,args.mem,time,n-1,limit,logDir,logDir))
+    # setup subject array""" % (queue,args.ncpu,args.mem,time,n-1,limit,logDir,logDir))
     print "sub = %s" % sub
     print 'tid = int(environ["PBS_ARRAY_INDEX"])'
-    print 'system("%s %s run %s %s --participant_label %%s" %% sub[tid])' % (args.cmd_pre,args.container,args.img,' '.join(fmriprep))
+    print 'system("%s %s run %s %s %s --participant_label %%s" %% sub[tid])' % (args.cmd_pre,args.container,cont_opts,args.img,' '.join(fmriprep))
 else:
     sys.exit('No sub- dirs found in %s' % args.bids_dir)
