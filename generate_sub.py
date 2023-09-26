@@ -1,6 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # coding: utf-8
 
+import argparse
 from glob import glob
 import os
 import pandas as pd
@@ -27,7 +28,7 @@ def main(bidsDir, derivativesDir, suffix=['_space-fsLR_den-91k_bold.dtseries.nii
     print(f'{sum(df["complete"])}/{df.shape[0]} completed subjects')
 
     # find subjects to run
-    subRun = df.index[df['complete'] == False]
+    subRun = [s.replace('sub-','') for s in df.index[df['complete'] == False]]
     print(subRun)
 
     print(f'{len(subRun)} subjects to run')
