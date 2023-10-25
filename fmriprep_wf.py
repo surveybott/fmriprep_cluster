@@ -276,7 +276,7 @@ def run_cifti_wf(inDir, workingDir, row, density='91k'):
     prep_wf.inputs.inputnode.func_bold = row['func']
     prep_wf.inputs.inputnode.t1w_brain = row['t1w']
     prep_wf.inputs.inputnode.t1w_mask = row['t1w_mask']
-    prep_wf.inputs.inputnode.xfm_bold_to_t1w = row['xfm_bold']
+    prep_wf.inputs.inputnode.xfm_bold_to_t1w = row['xfm_func']
     prep_wf.inputs.inputnode.xfm_t1w_to_std = row['xfm_anat']
 
     wf.connect(prep_wf, "outputnode.bold_t1w", surf_wf, "inputnode.source_file")
@@ -350,7 +350,7 @@ def main_tedana(inDir, workingDir, sub, cores, space='MNI152NLin6Asym', tedana=T
     return df
 
 
-def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz'):
+def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz', outputSpace='MNI152NLin6Asym', dummyRun=False):
     # run get ME data and run tedana in parallel
     df = find_func_data(inDir, sub, suffix)
 
@@ -359,37 +359,57 @@ def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz'):
         df['out_dir'] = df['func'].apply(lambda x: os.path.basename(x))
         args = []
         for index, row in df.iterrows():
-            space = row['space']
-            # get t1w and std transformations
+            # get files
+            xfm_bold = find_bold_xfm(inDir, row['sub'], row['ses'], row['prefix'])
             xfm_anat = find_anat_xfm(inDir, sub, row["ses"])
-            xfm_bold = find_std_xfm(inDir, sub, row["ses"]) # MNI to T1 xfm
-            if space in xfm_anat and space in xfm_anat:
-                df.loc[index, "xfm_anat"] = xfm_anat[space]
-                df.loc[index, "xfm_fsnative"] = xfm_anat["fsnative"]
-                df.loc[index, "xfm_bold"] = xfm_bold[space]
-                t1w = find_t1w(inDir, row['sub'], row['ses'])
-                df.loc[index, "t1w"] = t1w['image']
-                df.loc[index, 't1w_mask'] = t1w['mask']
-                # setup cifti pipeline calls
-                required = ["func", "xfm_bold", "xfm_anat", "xfm_fsnative", "t1w", "t1w_mask"]
-                if not any(df.loc[index, required].isna()):
-                    args.append((inDir, workingDir, df.loc[index, :]))
-                elif cifti:
-                    print(f'ERROR: f{df.loc[index,"prefix"]} missing required file(s)')
+            xfm_std = find_std_xfm(inDir, sub, row["ses"])
+            # get T1 to fsnative xfm
+            df.loc[index, "xfm_fsnative"] = xfm_anat["fsnative"]
+            # figure out functional space
+            space = row['space']
+            # scanner space and set xfm_func
+            if space is None:
+                if space in xfm_bold:
+                    df.loc[index, "xfm_func"] = xfm_bold[space]
+                    df.loc[index, 'space'] = outputSpace
+                else:
+                    print(f'ERROR: {df.loc[index,"prefix"]} missing scanner xfm')
+            # standard space
             else:
-                print(f'ERROR: f{df.loc[index,"prefix"]} missing {space} anat xfm')
-        # run cifti pipeline
+                if space in xfm_std:
+                    df.loc[index, "xfm_func"] = xfm_std[space]
+                else:
+                    print(f'ERROR: {df.loc[index,"prefix"]} no {space} to T1 xfm')
+                df.loc[index, "xfm_func"] = xfm
+            space = df.loc[index, "space"]
+            # get t1w and xfms
+            t1w = find_t1w(inDir, row['sub'], row['ses'])
+            df.loc[index, "t1w"] = t1w['image']
+            df.loc[index, 't1w_mask'] = t1w['mask']
+            if space in xfm_anat:
+                df.loc[index, "xfm_anat"] = xfm_anat[space]
+            else:
+                print(f'ERROR: {df.loc[index,"prefix"]} missing {space} anat xfm')
+            # setup cifti pipeline calls
+            required = ["func", "xfm_func", "xfm_anat", "xfm_fsnative", "t1w", "t1w_mask"]
+            if not any(df.loc[index, required].isna()):
+                args.append((inDir, workingDir, df.loc[index, :]))
+            elif cifti:
+                print(f'ERROR: {df.loc[index,"prefix"]} missing required file(s)')
+                
+        # run pipeline
         print(f'Running CIFTI pipeline for {len(args)} funcs')
         for func in df.loc[:,'func']:
             print(f'\t{func}')
-        print('\n')    
-        if cores == 1:
-            for a in args:
-                run_cifti_wf(*a)
-        else:
-            pool = Pool(cores)
-            pool.starmap(run_cifti_wf, args)
-            pool.close()
+        print('\n')
+        if not dummyRun:
+            if cores == 1:
+                for a in args:
+                    run_cifti_wf(*a)
+            else:
+                pool = Pool(cores)
+                pool.starmap(run_cifti_wf, args)
+                pool.close()
     else:
         raise Exception('Could not find any functional data')
     return df
@@ -400,9 +420,10 @@ if __name__ == '__main__':
     parser.add_argument('--workingDir', default=None, type=str, help='fmriprep working directory', required=True)
     parser.add_argument('--sub', default=None, type=str, help='subject name (without "sub-")', required=True)
     parser.add_argument('--cores', default=2, type=int)
+    parser.add_argument('--space', default='MNI152NLin6Asym', type=str)
+    parser.add_argument('--dummyRun', default=False, action='store_true', help='gather files but don\'t run')
     #parser.add_argument('--skipTedana', default=True, action='store_false', help='don\'t run tedana')
     #parser.add_argument('--skipCifti', default=True, action='store_false', help='don\'t transform tedana outputs to CIFTI')
-    #parser.add_argument('--space', default='MNI152NLin6Asym', type=str)
     #parser.add_argument('--fittype', default='curvefit', type=str)
     #parser.add_argument('--tedpca', default='kundu', type=str)
     #parser.add_argument('--gscontrol', default=None, type=str)
@@ -410,4 +431,5 @@ if __name__ == '__main__':
     if args.sub is not None:
         args.sub = args.sub.replace('sub-', '')
 
-    main_cifti(args.derivativeDir, args.workingDir, args.sub, cores=args.cores)
+    main_cifti(args.derivativeDir, args.workingDir, args.sub, cores=args.cores, space=space, dummyRun=args.dummyRun)
+
