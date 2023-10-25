@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from multiprocessing import Pool
 import time
-
+import nibabel as nib
 
 # find matching functional data for an individual subject
 def find_func_data(inDir, sub, suffix='*-preproc_bold.nii.gz'):
@@ -75,6 +75,17 @@ def find_tedana_outputs(inDir, prefix, spaces=["Native", "T1w", "MNI152NLin6Asym
 
 
 # find individual (subject-level) transformations
+def find_std_xfm(inDir, sub, ses=None):
+    files = glob(os.path.join(inDir, f'sub-{sub}', 'anat', f'sub-{sub}_*from-*_to-*'))
+    if not files and ses is not None:
+        files = glob(os.path.join(inDir, 'sub-'+sub, 'ses-'+ses, 'anat', f'sub-{sub}_ses-{ses}_*from-*_to-*'))
+    xfm = {}
+    for f in files:
+        if 'to-T1w' in f:
+            xfm[re.search('from-(.*)_mode', f).group(1).split('_to')[0]] = f
+    return xfm
+
+# find individual (subject-level) transformations
 def find_anat_xfm(inDir, sub, ses=None):
     files = glob(os.path.join(inDir, f'sub-{sub}', 'anat', f'sub-{sub}_*from-*_to-*'))
     if not files and ses is not None:
@@ -118,8 +129,12 @@ def find_t1w(inDir, sub, ses=None):
     return output
 
 
-def init_func_to_cifti_prep_wf(grayord_density, name='func_to_cifti_prep_wf'):
+def init_mni_to_cifti_prep_wf(grayord_density, name='mni_to_cifti_prep_wf'):
+    pass
 
+
+def init_func_to_cifti_prep_wf(grayord_density='91k', space='MNI152NLin6Asym', input_in_std=False, name='func_to_cifti_prep_wf'):
+    # input_in_std: False to transform from T1 space to std, otherwise pass through "func_bold" input
     from niworkflows.engine.workflows import LiterateWorkflow as Workflow
     from nipype.pipeline import engine as pe
     from nipype.interfaces import utility as niu
@@ -157,7 +172,7 @@ def init_func_to_cifti_prep_wf(grayord_density, name='func_to_cifti_prep_wf'):
         name="get_tpl",
         run_without_submitting=True
     )
-    get_tpl.inputs.space = 'MNI152NLin6Asym'
+    get_tpl.inputs.space = space
     get_tpl.inputs.resolution = mni_density
 
     gen_t1w_ref = pe.Node(
@@ -188,25 +203,36 @@ def init_func_to_cifti_prep_wf(grayord_density, name='func_to_cifti_prep_wf'):
                               ('t1w_mask', 'fov_mask')]),
         (inputnode, func_t1w_tfm, [('func_bold', 'input_image'),
                                   ('xfm_bold_to_t1w','transforms')]),
-        (inputnode, func_std_tfm, [('func_bold', 'input_image')]),
-        (inputnode, merge_std_tfms, [('xfm_t1w_to_std','in1'),
-                                    ('xfm_bold_to_t1w','in2')]),
-        (merge_std_tfms, func_std_tfm, [('out', 'transforms')]),
-        (get_tpl, func_std_tfm, [('out', 'reference_image')]),
         (gen_t1w_ref, func_t1w_tfm, [('out_file', 'reference_image')]),
-        (func_t1w_tfm, outputnode, [('output_image', 'bold_t1w')]),
-        (func_std_tfm, outputnode, [('output_image', 'bold_std')])
+        (func_t1w_tfm, outputnode, [('output_image', 'bold_t1w')])
     ])
 
+    # setup standard space output
+    if not input_in_std:
+        workflow.connect([
+            (inputnode, func_std_tfm, [('func_bold', 'input_image')]),
+            (inputnode, merge_std_tfms, [('xfm_t1w_to_std','in1'),
+                                        ('xfm_bold_to_t1w','in2')]),
+            (merge_std_tfms, func_std_tfm, [('out', 'transforms')]),
+            (get_tpl, func_std_tfm, [('out', 'reference_image')]),
+            (func_std_tfm, outputnode, [('output_image', 'bold_std')])
+        ])
+    else:
+        workflow.connect([
+            (inputnode, outputnode, [('func_bold', 'bold_std')])
+        ])
     return workflow
 
-def _get_template(space, resolution=None):
+def _get_template(space, resolution=None, suffix='T1w'):
     from niworkflows.utils.misc import get_template_specs
-    specs = {}
+    if suffix is not None:
+        specs = {'suffix':'T1w'}
     if resolution is not None:
-        specs = {'resolution':resolution}
+        specs['resolution'] = resolution
     return get_template_specs(space, specs)[0]
 
+def _get_dims(nifti):
+    return nib.load(nifti).header.get('dim')[1:4]
 
 # run tedana_workflow
 def run_tedana(prefix, echo_images, echo_times, out_dir, fittype='curvefit', tedpca='kundu', gscontrol=None):
@@ -232,7 +258,14 @@ def run_cifti_wf(inDir, workingDir, row, density='91k'):
     from nipype.pipeline import engine as pe
 
     wf = pe.Workflow(name=f'{row["prefix"]}_cifti_wf', base_dir=os.path.join(workingDir, "cifti_wf"))
-    prep_wf = init_func_to_cifti_prep_wf(grayord_density=density)
+    
+    # prep - find if std transformation is needed
+    if all(_get_dims(_get_template(row['space'], 2)) == _get_dims(row['func'])):
+        input_in_std = True
+    else:
+        input_in_std = False
+    prep_wf = init_func_to_cifti_prep_wf(grayord_density=density, space=row['space'], input_in_std=input_in_std)
+    # fmriprep surf and cifti wf
     surf_wf = init_bold_surf_wf(surface_spaces=["fsaverage"], medial_surface_nan=True, project_goodvoxels=False, mem_gb=2)
     cifti_wf = init_bold_grayords_wf(grayord_density=density, repetition_time=2, mem_gb=5)
 
@@ -259,7 +292,7 @@ def run_cifti_wf(inDir, workingDir, row, density='91k'):
 
     cifti_wf.inputs.inputnode.spatial_reference = ['MNI152NLin6Asym_res-2']
     cifti_wf.inputs.inputnode.surf_refs = ["fsaverage"]
-    #cifti_wf.inputs.inputnode.subjects_dir = os.path.join(inDir, "sourcedata", "freesurfer")
+    #cifti_wf.inputs.inputnode.subjects_dir = os.path.join(inDir, "sourcedata", "freesurfer") # not input in 23.0.2 
 
     outfolder = f'sub-{row["sub"]}'
     if row['ses'] is not None:
@@ -317,7 +350,7 @@ def main_tedana(inDir, workingDir, sub, cores, space='MNI152NLin6Asym', tedana=T
     return df
 
 
-def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz', space='MNI152NLin6Asym'):
+def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz'):
     # run get ME data and run tedana in parallel
     df = find_func_data(inDir, sub, suffix)
 
@@ -326,12 +359,14 @@ def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz', sp
         df['out_dir'] = df['func'].apply(lambda x: os.path.basename(x))
         args = []
         for index, row in df.iterrows():
+            space = row['space']
             # get t1w and std transformations
             xfm_anat = find_anat_xfm(inDir, sub, row["ses"])
-            if space in xfm_anat:
+            xfm_bold = find_std_xfm(inDir, sub, row["ses"]) # MNI to T1 xfm
+            if space in xfm_anat and space in xfm_anat:
                 df.loc[index, "xfm_anat"] = xfm_anat[space]
                 df.loc[index, "xfm_fsnative"] = xfm_anat["fsnative"]
-                df.loc[index, "xfm_bold"] = find_bold_xfm(inDir, row['sub'], row['ses'], row['prefix'])
+                df.loc[index, "xfm_bold"] = xfm_bold[space]
                 t1w = find_t1w(inDir, row['sub'], row['ses'])
                 df.loc[index, "t1w"] = t1w['image']
                 df.loc[index, 't1w_mask'] = t1w['mask']
@@ -345,6 +380,9 @@ def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz', sp
                 print(f'ERROR: f{df.loc[index,"prefix"]} missing {space} anat xfm')
         # run cifti pipeline
         print(f'Running CIFTI pipeline for {len(args)} funcs')
+        for func in df.loc[:,'func']:
+            print(f'\t{func}')
+        print('\n')    
         if cores == 1:
             for a in args:
                 run_cifti_wf(*a)
@@ -364,7 +402,7 @@ if __name__ == '__main__':
     parser.add_argument('--cores', default=2, type=int)
     #parser.add_argument('--skipTedana', default=True, action='store_false', help='don\'t run tedana')
     #parser.add_argument('--skipCifti', default=True, action='store_false', help='don\'t transform tedana outputs to CIFTI')
-    parser.add_argument('--space', default='MNI152NLin6Asym', type=str)
+    #parser.add_argument('--space', default='MNI152NLin6Asym', type=str)
     #parser.add_argument('--fittype', default='curvefit', type=str)
     #parser.add_argument('--tedpca', default='kundu', type=str)
     #parser.add_argument('--gscontrol', default=None, type=str)
