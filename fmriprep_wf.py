@@ -9,32 +9,31 @@ from multiprocessing import Pool
 import time
 
 
-# find
-def find_func_data(inDir, sub, suffix='*_preproc_bold.nii.gz'):
-    # find all (lightly) preprocessed echo images
-    echo_images_all = glob(f'{inDir}/sub-{sub}/**/sub-{sub}_{suffix}', recursive=True)
-    echo_images_all = [f for f in echo_images_all if "_space-" not in f]
-    image_prefix = [re.search('(.*)_echo-', os.path.basename(f)).group(1) for f in echo_images_all]
-    image_prefix = set(image_prefix)
+# find matching functional data for an individual subject
+def find_func_data(inDir, sub, suffix='*-preproc_bold.nii.gz'):
+    func = glob(f'{inDir}/sub-{sub}/**/sub-{sub}_{suffix}', recursive=True)
     df = []
     # loop over runs
-    for prefix in image_prefix:
+    for nii in func:
+        prefix = os.path.basename(nii).replace('.nii.gz','').replace('.nii','')
+        space = prefix.split('_space-')
+        if len(space) > 1:
+            prefix = space[0]
+            space = space[1].split('_')[0]
+        else:
+            space = None
         sub = prefix.split('_')[0].replace('sub-','')
         ses = prefix.split('ses-')
         if len(ses) > 1:
             ses = ses[1].split('_')[0]
         else:
             ses = None
-        run = 'task-'+prefix.split('_task-')[1]
-        # find images matching the appropriate run prefix
-        echo_images = [f for f in echo_images_all if (prefix in f)]
-        echo_images.sort()
-        # read echo times out of json and sort
-        echo_times = [json.load(open(f.replace('.nii.gz','.json')))['EchoTime'] for f in echo_images]
-        echo_times.sort()
+            
+        df.append((sub, ses, prefix, space, nii))
+        
+    return pd.DataFrame(data=df, columns=['sub', 'ses', 'prefix', 'space', 'func'])
 
-        df.append((sub, ses, prefix, run, echo_images, echo_times))
-    return pd.DataFrame(data=df, columns=['sub', 'ses', 'prefix', 'run', 'echo_images', 'echo_times'])
+
 # find individual echo images (and get info) from fmriprep directory
 def find_multiecho_data(inDir, sub):
     # find all (lightly) preprocessed echo images
@@ -77,9 +76,9 @@ def find_tedana_outputs(inDir, prefix, spaces=["Native", "T1w", "MNI152NLin6Asym
 
 # find individual (subject-level) transformations
 def find_anat_xfm(inDir, sub, ses=None):
-    files = glob(os.path.join(inDir, f'sub-{sub}', 'anat', f'sub-{sub}_from-*_to-*'))
+    files = glob(os.path.join(inDir, f'sub-{sub}', 'anat', f'sub-{sub}_*from-*_to-*'))
     if not files and ses is not None:
-        files = glob(os.path.join(inDir, 'sub-'+sub, 'ses-'+ses, 'anat', f'sub-{sub}_ses-{ses}_from-*_to-*'))
+        files = glob(os.path.join(inDir, 'sub-'+sub, 'ses-'+ses, 'anat', f'sub-{sub}_ses-{ses}_*from-*_to-*'))
     xfm = {}
     for f in files:
         if 'from-T1w' in f:
@@ -110,12 +109,12 @@ def find_t1w(inDir, sub, ses=None):
         else:
             anat = os.path.join(inDir, f'sub-{sub}', f'ses-{ses}', 'anat')
             prefix = f'{prefix}_ses-{ses}'
-    files = {'image': f'{prefix}_desc-preproc_T1w.nii.gz', 'mask': f'{prefix}_desc-brain_mask.nii.gz'}
+    files = {'image': f'{prefix}*_desc-preproc_T1w.nii.gz', 'mask': f'{prefix}*_desc-brain_mask.nii.gz'}
     for key, value in files.items():
-        f = os.path.join(anat, value)
-        if not os.path.exists(f):
+        f = [x for x in glob(os.path.join(anat, value)) if '_space-MNI' not in x]
+        if len(f) != 1:
             f = None
-        output[key] = f
+        output[key] = f[0]
     return output
 
 
@@ -232,16 +231,16 @@ def run_cifti_wf(inDir, workingDir, row, density='91k'):
     from nipype.interfaces import utility as niu
     from nipype.pipeline import engine as pe
 
-    wf = pe.Workflow(name=f'{row["prefix"]}_cifti_wf', base_dir=os.path.join(workingDir, "tedana_cifti_wf"))
+    wf = pe.Workflow(name=f'{row["prefix"]}_cifti_wf', base_dir=os.path.join(workingDir, "cifti_wf"))
     prep_wf = init_func_to_cifti_prep_wf(grayord_density=density)
-    surf_wf = init_bold_surf_wf(surface_spaces=["fsaverage"], medial_surface_nan=True, mem_gb=2)
+    surf_wf = init_bold_surf_wf(surface_spaces=["fsaverage"], medial_surface_nan=True, project_goodvoxels=False, mem_gb=2)
     cifti_wf = init_bold_grayords_wf(grayord_density=density, repetition_time=2, mem_gb=5)
 
     ds = pe.Node(nio.DataSink(parameterization=False), name='datasinker')
     ds.inputs.base_directory = inDir
-    ds.inputs.substitutions = [("space-Native", f'space-fsLR_den-{density}')]
+    ds.inputs.substitutions = [(f'space-{row["space"]}', f'space-fsLR_den-{density}')]
 
-    prep_wf.inputs.inputnode.func_bold = row['Native']
+    prep_wf.inputs.inputnode.func_bold = row['func']
     prep_wf.inputs.inputnode.t1w_brain = row['t1w']
     prep_wf.inputs.inputnode.t1w_mask = row['t1w_mask']
     prep_wf.inputs.inputnode.xfm_bold_to_t1w = row['xfm_bold']
@@ -260,7 +259,7 @@ def run_cifti_wf(inDir, workingDir, row, density='91k'):
 
     cifti_wf.inputs.inputnode.spatial_reference = ['MNI152NLin6Asym_res-2']
     cifti_wf.inputs.inputnode.surf_refs = ["fsaverage"]
-    cifti_wf.inputs.inputnode.subjects_dir = os.path.join(inDir, "sourcedata", "freesurfer")
+    #cifti_wf.inputs.inputnode.subjects_dir = os.path.join(inDir, "sourcedata", "freesurfer")
 
     outfolder = f'sub-{row["sub"]}'
     if row['ses'] is not None:
@@ -270,7 +269,7 @@ def run_cifti_wf(inDir, workingDir, row, density='91k'):
     wf.run()
 
 
-def main(inDir, workingDir, sub, cores, space='MNI152NLin6Asym', tedana=True, fittype='curvefit', tedpca='kundu', gscontrol=None, cifti=True):
+def main_tedana(inDir, workingDir, sub, cores, space='MNI152NLin6Asym', tedana=True, fittype='curvefit', tedpca='kundu', gscontrol=None, cifti=True):
     # run get ME data and run tedana in parallel
     df = find_multiecho_data(inDir, sub)
 
@@ -318,20 +317,59 @@ def main(inDir, workingDir, sub, cores, space='MNI152NLin6Asym', tedana=True, fi
     return df
 
 
+def main_cifti(inDir, workingDir, sub, cores, suffix='*-preproc_bold.nii.gz', space='MNI152NLin6Asym'):
+    # run get ME data and run tedana in parallel
+    df = find_func_data(inDir, sub, suffix)
+
+    if not df.empty:
+        # add 'out_dir'
+        df['out_dir'] = df['func'].apply(lambda x: os.path.basename(x))
+        args = []
+        for index, row in df.iterrows():
+            # get t1w and std transformations
+            xfm_anat = find_anat_xfm(inDir, sub, row["ses"])
+            if space in xfm_anat:
+                df.loc[index, "xfm_anat"] = xfm_anat[space]
+                df.loc[index, "xfm_fsnative"] = xfm_anat["fsnative"]
+                df.loc[index, "xfm_bold"] = find_bold_xfm(inDir, row['sub'], row['ses'], row['prefix'])
+                t1w = find_t1w(inDir, row['sub'], row['ses'])
+                df.loc[index, "t1w"] = t1w['image']
+                df.loc[index, 't1w_mask'] = t1w['mask']
+                # setup cifti pipeline calls
+                required = ["func", "xfm_bold", "xfm_anat", "xfm_fsnative", "t1w", "t1w_mask"]
+                if not any(df.loc[index, required].isna()):
+                    args.append((inDir, workingDir, df.loc[index, :]))
+                elif cifti:
+                    print(f'ERROR: f{df.loc[index,"prefix"]} missing required file(s)')
+            else:
+                print(f'ERROR: f{df.loc[index,"prefix"]} missing {space} anat xfm')
+        # run cifti pipeline
+        print(f'Running CIFTI pipeline for {len(args)} funcs')
+        if cores == 1:
+            for a in args:
+                run_cifti_wf(*a)
+        else:
+            pool = Pool(cores)
+            pool.starmap(run_cifti_wf, args)
+            pool.close()
+    else:
+        raise Exception('Could not find any functional data')
+    return df
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='run tedana (after fmriprep) and transform outputs to standard space')
+    parser = argparse.ArgumentParser(description='transform volumetric nifti functional data to fs-LR cifti surface space')
     parser.add_argument('--derivativeDir', default=None, type=str, help='fmriprep derivative directory', required=True)
     parser.add_argument('--workingDir', default=None, type=str, help='fmriprep working directory', required=True)
     parser.add_argument('--sub', default=None, type=str, help='subject name (without "sub-")', required=True)
-    parser.add_argument('--cores', default=4, type=int)
-    parser.add_argument('--skipTedana', default=True, action='store_false', help='don\'t run tedana')
-    parser.add_argument('--skipCifti', default=True, action='store_false', help='don\'t transform tedana outputs to CIFTI')
+    parser.add_argument('--cores', default=2, type=int)
+    #parser.add_argument('--skipTedana', default=True, action='store_false', help='don\'t run tedana')
+    #parser.add_argument('--skipCifti', default=True, action='store_false', help='don\'t transform tedana outputs to CIFTI')
     parser.add_argument('--space', default='MNI152NLin6Asym', type=str)
-    parser.add_argument('--fittype', default='curvefit', type=str)
-    parser.add_argument('--tedpca', default='kundu', type=str)
-    parser.add_argument('--gscontrol', default=None, type=str)
+    #parser.add_argument('--fittype', default='curvefit', type=str)
+    #parser.add_argument('--tedpca', default='kundu', type=str)
+    #parser.add_argument('--gscontrol', default=None, type=str)
     args = parser.parse_args()
     if args.sub is not None:
         args.sub = args.sub.replace('sub-', '')
 
-    main(args.derivativeDir, args.workingDir, args.sub, cores=args.cores, tedana=args.skipTedana, fittype=args.fittype, tedpca=args.tedpca, gscontrol=args.gscontrol, cifti=args.skipCifti)
+    main_cifti(args.derivativeDir, args.workingDir, args.sub, cores=args.cores)
